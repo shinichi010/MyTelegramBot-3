@@ -52,6 +52,10 @@ def _download_sync(url):
         'cookiefile': 'cookies.txt' if os.path.exists('cookies.txt') else None,
         'quiet': True,
         'no_warnings': True,
+        'socket_timeout': 30, # وقت انتظار أطول علمود الفيسبوك
+        'http_headers': {     # هيدر وهمي لتخطي بعض حمايات المواقع
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        }
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -75,17 +79,17 @@ async def check_and_add_user(user, context: ContextTypes.DEFAULT_TYPE):
         }
         await users_collection.insert_one(user_data)
         
-        # إرسال إشعار للآدمن
+        # إرسال إشعار للآدمن (استخدمنا HTML لتفادي مشاكل الرموز بالأسماء)
         notification_text = (
-            f"👤 مستخدم جديد استخدم البوت!\n\n"
+            f"👤 <b>مستخدم جديد استخدم البوت!</b>\n\n"
             f"الاسم: {user.first_name}\n"
             f"اليوزر: @{user.username if user.username else 'لا يوجد'}\n"
-            f"الآيدي: `{user.id}`"
+            f"الآيدي: <code>{user.id}</code>"
         )
         target_chat = ADMIN_CHANNEL if ADMIN_CHANNEL else ADMIN_ID
         if target_chat and target_chat != 0:
             try:
-                await context.bot.send_message(chat_id=target_chat, text=notification_text, parse_mode='Markdown')
+                await context.bot.send_message(chat_id=target_chat, text=notification_text, parse_mode='HTML')
             except Exception as e:
                 logger.error(f"Failed to send admin notification: {e}")
     return existing_user
@@ -103,7 +107,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_msg = (
         f"مرحباً {user.first_name}! 👋\n\n"
         "أنا بوت تحميل الميديا. أقدر أحملك الصور، المقاطع، والستوريات من المنصات التالية:\n"
-        "✅ تيك توك\n"
+        "✅ تيك توك (فيديوهات فقط)\n"
         "✅ فيسبوك\n"
         "✅ انستكرام\n"
         "✅ إكس (تويتر)\n"
@@ -122,7 +126,7 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
         
     # 1. فحص منصات يوتيوب وسبوتيفاي
-    redirect_domains = ['youtube.com', 'youtu.be', 'music.youtube.com', 'spotify.com']
+    redirect_domains = ['youtube.com', 'youtu.be', 'music.youtube.com', 'spotify.com', 'spotify.com']
     if any(domain in text.lower() for domain in redirect_domains):
         await update.message.reply_text("للتنزيل من هاي المنصة استخدم هذا البوت: @ReiSave_bot 🤖")
         return
@@ -145,7 +149,11 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
         except Exception as e:
             logger.error(f"Error downloading {text}: {e}")
-            await status_msg.edit_text("❌ عذراً، صار خطأ أثناء التحميل. تأكد من الرابط أو حاول مرة ثانية.")
+            # تخصيص رسالة الخطأ بحالة روابط صور التيك توك
+            if "Unsupported URL" in str(e) and ("/photo/" in text or "tiktok.com" in text.lower()):
+                await status_msg.edit_text("❌ عذراً، هذا الرابط يبدو أنه يحتوي على (صور/سلايدات). البوت حالياً يدعم تحميل الفيديوهات فقط.")
+            else:
+                await status_msg.edit_text("❌ عذراً، صار خطأ أثناء التحميل. تأكد من الرابط أو أن المقطع ليس خاصاً (Private).")
             
         return
         
@@ -172,12 +180,12 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f.write(users_text)
         
     stats_msg = (
-        f"📊 **إحصائيات البوت**\n\n"
+        f"📊 <b>إحصائيات البوت</b>\n\n"
         f"👥 عدد المستخدمين الكلي: {total_users}\n"
         f"💾 استهلاك مساحة السحابة (MongoDB): {data_size_mb:.2f} MB من أصل 500 MB\n"
     )
     
-    await update.message.reply_document(document=open("users_list.txt", "rb"), caption=stats_msg, parse_mode='Markdown')
+    await update.message.reply_document(document=open("users_list.txt", "rb"), caption=stats_msg, parse_mode='HTML')
     os.remove("users_list.txt")
     await msg.delete()
 
@@ -187,7 +195,7 @@ async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         target_id = int(context.args[0])
         await users_collection.update_one({"user_id": target_id}, {"$set": {"is_banned": True}})
-        await update.message.reply_text(f"✅ تم حظر المستخدم `{target_id}` بنجاح.", parse_mode='Markdown')
+        await update.message.reply_text(f"✅ تم حظر المستخدم <code>{target_id}</code> بنجاح.", parse_mode='HTML')
     except (IndexError, ValueError):
         await update.message.reply_text("❌ أرسل الأمر متبوعاً بآيدي المستخدم.\nمثال: `/ban 123456789`")
 
