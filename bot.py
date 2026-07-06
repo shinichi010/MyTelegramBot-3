@@ -2,71 +2,95 @@ import os
 import asyncio
 import logging
 import base64
+import glob
 from aiohttp import web
 import yt_dlp
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from motor.motor_asyncio import AsyncIOMotorClient
 
 # --- إعدادات اللوك (Logging) ---
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- المتغيرات البيئية (Environment Variables) ---
+# --- المتغيرات البيئية ---
 BOT_TOKEN = os.getenv("BOT_TOKEN", "توكن_البوت")
 MONGO_URI = os.getenv("MONGO_URI", "رابط_مونكو")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0")) # حط الأيدي مالتك هنا بالريندر
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 ADMIN_CHANNEL = os.getenv("ADMIN_CHANNEL", None)
 PORT = int(os.environ.get("PORT", 8080))
 COOKIES_DATA = os.getenv("COOKIES_DATA", "")
+CUSTOM_USER_AGENT = os.getenv("USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 
 # --- الاتصال بقاعدة البيانات ---
 client = AsyncIOMotorClient(MONGO_URI)
 db = client['media_bot_db']
 users_collection = db['users']
+settings_collection = db['settings']
 
 # ==========================================
-# قسم تجهيز الكوكيز
+# قسم الإعدادات الديناميكية (MongoDB)
 # ==========================================
+async def get_bot_settings():
+    """جلب الإعدادات أو إنشائها الافتراضية"""
+    settings = await settings_collection.find_one({"config": "main"})
+    if not settings:
+        default_settings = {
+            "config": "main",
+            "welcome_message": "مرحباً {name}! 👋\n\nأنا بوت تحميل الميديا. أقدر أحملك الصور والمقاطع من التيك توك، الانستا، الفيس، إكس، وساوند كلاود.\n\nللتحميل من يوتيوب وسبوتيفاي استخدم: @ReiSave_bot"
+        }
+        await settings_collection.insert_one(default_settings)
+        return default_settings
+    return settings
+
 def setup_cookies():
-    """دالة لفك تشفير الكوكيز من Base64 وتحويلها لملف txt"""
+    """فك تشفير الكوكيز لحسابات الانستا والفيس"""
     if COOKIES_DATA:
         try:
             decoded_cookies = base64.b64decode(COOKIES_DATA).decode('utf-8')
             with open("cookies.txt", "w", encoding="utf-8") as f:
                 f.write(decoded_cookies)
-            logger.info("✅ تم تجهيز ملف الكوكيز (cookies.txt) بنجاح.")
+            logger.info("✅ تم تجهيز ملف الكوكيز بنجاح.")
         except Exception as e:
-            logger.error(f"❌ صار خطأ أثناء فك تشفير الكوكيز: {e}")
-    else:
-        logger.warning("⚠️ متغير COOKIES_DATA غير موجود.")
+            logger.error(f"❌ خطأ بالكوكيز: {e}")
 
 # ==========================================
-# قسم التحميل (yt-dlp)
+# قسم التحميل الذكي (يدعم فيديوهات وصور التيك توك والمنصات)
 # ==========================================
 def _download_sync(url):
-    """دالة التحميل المتزامنة (Sync) اللي تستخدم yt-dlp"""
+    """إعدادات متطورة لتخطي حظر الانستا والفيس وتنزيل البومات الصور"""
     ydl_opts = {
-        'outtmpl': '%(id)s.%(ext)s',
-        'format': 'best', # يختار أفضل جودة
+        'outtmpl': 'downloads/%(id)s_%(playlist_index)s.%(ext)s',
         'cookiefile': 'cookies.txt' if os.path.exists('cookies.txt') else None,
         'quiet': True,
         'no_warnings': True,
-        'socket_timeout': 30, # وقت انتظار أطول علمود الفيسبوك
-        'http_headers': {     # هيدر وهمي لتخطي بعض حمايات المواقع
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'socket_timeout': 40,
+        'allow_playlist_handle': True,
+        'extract_flat': False,
+        'http_headers': {
+            'User-Agent': CUSTOM_USER_AGENT,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Sec-Fetch-Mode': 'navigate',
+        },
+        'extractor_args': {
+            'instagram': {'apps': True},
+            'twitter': {'api': 'graphql'}
         }
     }
+    
+    if not os.path.exists('downloads'):
+        os.makedirs('downloads')
+        
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
-        return ydl.prepare_filename(info)
+        return info
 
 async def download_media(url):
-    """تشغيل دالة التحميل بثريد منفصل علمود ميوكف البوت عن باقي المستخدمين"""
     return await asyncio.to_thread(_download_sync, url)
 
 # ==========================================
-# قسم قاعدة البيانات والإدارة
+# إدارة المستخدمين والإشعارات
 # ==========================================
 async def check_and_add_user(user, context: ContextTypes.DEFAULT_TYPE):
     existing_user = await users_collection.find_one({"user_id": user.id})
@@ -79,9 +103,9 @@ async def check_and_add_user(user, context: ContextTypes.DEFAULT_TYPE):
         }
         await users_collection.insert_one(user_data)
         
-        # إرسال إشعار للآدمن (استخدمنا HTML لتفادي مشاكل الرموز بالأسماء)
+        # إشعار الآدمن
         notification_text = (
-            f"👤 <b>مستخدم جديد استخدم البوت!</b>\n\n"
+            f"👤 <b>مستخدم جديد دخل للبوت أول مرة!</b>\n\n"
             f"الاسم: {user.first_name}\n"
             f"اليوزر: @{user.username if user.username else 'لا يوجد'}\n"
             f"الآيدي: <code>{user.id}</code>"
@@ -91,155 +115,196 @@ async def check_and_add_user(user, context: ContextTypes.DEFAULT_TYPE):
             try:
                 await context.bot.send_message(chat_id=target_chat, text=notification_text, parse_mode='HTML')
             except Exception as e:
-                logger.error(f"Failed to send admin notification: {e}")
+                logger.error(f"⚠️ لم يتم إرسال إشعار الآدمن: {e}. (تأكد انك مفعل البوت أولاً ودزيتله /start)")
     return existing_user
 
 # ==========================================
-# أوامر التليكرام
+# معالجة الرسائل والروابط المدعومة
 # ==========================================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_db = await check_and_add_user(user, context)
+    if user_db and user_db.get("is_banned"): return
     
-    if user_db and user_db.get("is_banned"):
-        return
-        
-    welcome_msg = (
-        f"مرحباً {user.first_name}! 👋\n\n"
-        "أنا بوت تحميل الميديا. أقدر أحملك الصور، المقاطع، والستوريات من المنصات التالية:\n"
-        "✅ تيك توك (فيديوهات فقط)\n"
-        "✅ فيسبوك\n"
-        "✅ انستكرام\n"
-        "✅ إكس (تويتر)\n"
-        "✅ ساوند كلاود\n\n"
-        "🎶 أما بالنسبة للـ (YouTube, YouTube Music, Spotify) "
-        "فقط أرسل الرابط وراح أوجهك للبوت المخصص إلهن."
-    )
-    await update.message.reply_text(welcome_msg)
+    settings = await get_bot_settings()
+    welcome_text = settings["welcome_message"].format(name=user.first_name)
+    await update.message.reply_text(welcome_text)
 
 async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = update.message.text
     
     user_db = await check_and_add_user(user, context)
-    if user_db and user_db.get("is_banned"):
-        return
-        
-    # 1. فحص منصات يوتيوب وسبوتيفاي
-    redirect_domains = ['youtube.com', 'youtu.be', 'music.youtube.com', 'spotify.com', 'spotify.com']
+    if user_db and user_db.get("is_banned"): return
+
+    # حالة انتظار مدخلات الآدمن لتغيير الرسالة أو الحظر
+    if context.user_data.get("admin_state") and user.id == ADMIN_ID:
+        state = context.user_data.get("admin_state")
+        if state == "waiting_welcome":
+            await settings_collection.update_one({"config": "main"}, {"$set": {"welcome_message": text}})
+            await update.message.reply_text("✅ تم تحديث رسالة الترحيب بنجاح!")
+            context.user_data.clear()
+            return
+        elif state == "waiting_ban":
+            try:
+                uid = int(text)
+                await users_collection.update_one({"user_id": uid}, {"$set": {"is_banned": True}})
+                await update.message.reply_text(f"🔒 تم حظر المستخدم {uid}")
+            except:
+                await update.message.reply_text("❌ الآيدي غير صالح.")
+            context.user_data.clear()
+            return
+        elif state == "waiting_unban":
+            try:
+                uid = int(text)
+                await users_collection.update_one({"user_id": uid}, {"$set": {"is_banned": False}})
+                await update.message.reply_text(f"🔓 تم إلغاء حظر المستخدم {uid}")
+            except:
+                await update.message.reply_text("❌ الآيدي غير صالح.")
+            context.user_data.clear()
+            return
+
+    # توجيه منصات يوتيوب وسبوتيفاي
+    redirect_domains = ['youtube.com', 'youtu.be', 'music.youtube.com', 'spotify.com']
     if any(domain in text.lower() for domain in redirect_domains):
         await update.message.reply_text("للتنزيل من هاي المنصة استخدم هذا البوت: @ReiSave_bot 🤖")
         return
 
-    # 2. فحص المنصات المدعومة
+    # المنصات المدعومة
     supported_domains = ['tiktok.com', 'facebook.com', 'fb.watch', 'instagram.com', 'twitter.com', 'x.com', 'soundcloud.com']
     if any(domain in text.lower() for domain in supported_domains):
-        status_msg = await update.message.reply_text("⏳ جاري التحميل، انتظر ثواني...")
+        status_msg = await update.message.reply_text("⏳ جاري سحب ومعالجة الرابط، انتظر ثواني...")
         
         try:
-            # تحميل الملف
-            file_path = await download_media(text)
+            info = await download_media(text)
             
-            # إرسال الملف للمستخدم
-            await update.message.reply_video(video=open(file_path, 'rb'))
-            
-            # حذف الملف من السيرفر حتى ما ياخذ مساحة
-            os.remove(file_path)
+            # فحص إذا كان المنشور البوم صور (مثل تيك توك)
+            if 'entries' in info or (info.get('_type') == 'playlist') or ('requested_downloads' in info and len(info['requested_downloads']) > 1):
+                downloaded_files = glob.glob("downloads/*")
+                images = [f for f in downloaded_files if f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp'))]
+                audio = [f for f in downloaded_files if f.lower().endswith(('.mp3', '.m4a', '.wav', '.ogg', '.webm'))]
+                
+                uploader = info.get('uploader', 'Unknown')
+                description = info.get('description', 'بدون وصف')
+                total_pics = len(images)
+                
+                caption = f"👤 الحساب: @{uploader}\n📸 عدد الصور: {total_pics}\n\n📝 الوصف والهاشتاقات:\n{description[:800]}"
+                
+                # إرسال الصور كمجموعات (كل مجموعة 10 صور كحد أقصى)
+                for i in range(0, len(images), 10):
+                    chunk = images[i:i+10]
+                    media_group = []
+                    for idx, img in enumerate(chunk):
+                        if i == 0 and idx == 0:
+                            media_group.append(InputMediaPhoto(open(img, 'rb'), caption=caption))
+                        else:
+                            media_group.append(InputMediaPhoto(open(img, 'rb')))
+                    await update.message.reply_media_group(media=media_group)
+                
+                # إرسال الصوت الخلفي للمنشور إذا وجد
+                if audio:
+                    await update.message.reply_audio(audio=open(audio[0], 'rb'), caption="🎵 صوت المنشور المصاحب")
+                    
+            else:
+                # تحميل فيديو عادي أو ملف صوت منفرد
+                downloaded_files = glob.glob("downloads/*")
+                if downloaded_files:
+                    target_file = downloaded_files[0]
+                    if target_file.lower().endswith(('.mp3', '.m4a', '.ogg', '.wav')):
+                        await update.message.reply_audio(audio=open(target_file, 'rb'))
+                    else:
+                        await update.message.reply_video(video=open(target_file, 'rb'))
+                else:
+                    raise Exception("No files downloaded")
+                    
+            # تنظيف المجلد المؤقت فوراً لحفظ مساحة السيرفر
+            for f in glob.glob("downloads/*"):
+                os.remove(f)
             await status_msg.delete()
             
         except Exception as e:
-            logger.error(f"Error downloading {text}: {e}")
-            # تخصيص رسالة الخطأ بحالة روابط صور التيك توك
-            if "Unsupported URL" in str(e) and ("/photo/" in text or "tiktok.com" in text.lower()):
-                await status_msg.edit_text("❌ عذراً، هذا الرابط يبدو أنه يحتوي على (صور/سلايدات). البوت حالياً يدعم تحميل الفيديوهات فقط.")
-            else:
-                await status_msg.edit_text("❌ عذراً، صار خطأ أثناء التحميل. تأكد من الرابط أو أن المقطع ليس خاصاً (Private).")
+            logger.error(f"Error processing {text}: {e}")
+            for f in glob.glob("downloads/*"): 
+                try: os.remove(f)
+                except: pass
+            await status_msg.edit_text("❌ حدث خطأ أثناء التحميل. تأكد أن الرابط عام وليس من حساب خاص (Private)، أو أعد المحاولة لاحقاً.")
+        return
+
+# ==========================================
+# لوحة تحكم الآدمن المتقدمة بأزرار إنلاين
+# ==========================================
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID: return
+    
+    keyboard = [
+        [InlineKeyboardButton("📊 الإحصائيات والسحابة", callback_data="adm_stats")],
+        [InlineKeyboardButton("📝 تعديل رسالة الترحيب", callback_data="adm_edit_welcome")],
+        [InlineKeyboardButton("🚫 حظر مستخدم", callback_data="adm_ban"), InlineKeyboardButton("🔓 إلغاء حظر", callback_data="adm_unban")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("🛠️ <b>أهلاً بك في لوحة تحكم الآدمن:</b>", reply_markup=reply_markup, parse_mode='HTML')
+
+async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "adm_stats":
+        db_stats = await db.command("dbstats")
+        data_size_mb = db_stats.get("dataSize", 0) / (1024 * 1024)
+        
+        users_cursor = users_collection.find({})
+        users_list = await users_cursor.to_list(length=None)
+        
+        users_text = "📊 <b>إحصائيات البوت الحالية:</b>\n\n"
+        users_text += f"👥 عدد المشتركين: {len(users_list)}\n"
+        users_text += f"💾 استهلاك MongoDB: {data_size_mb:.2f} MB / 500 MB\n\n"
+        users_text += "<b>قائمة الأعضاء ويوزراتهم:</b>\n"
+        
+        for u in users_list[:40]: # جلب أول 40 عضو بالرسالة للحفاظ على الحجم
+            uname = f"@{u['username']}" if u.get('username') else "لا يوجد"
+            status = " [محظور]" if u.get('is_banned') else ""
+            users_text += f"- {u.get('first_name')} | {uname} | <code>{u.get('user_id')}</code>{status}\n"
             
-        return
+        await query.edit_message_text(users_text, parse_mode='HTML')
         
-    await update.message.reply_text("❌ عذراً، هذا الرابط غير مدعوم أو غير صالح.")
-
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
+    elif query.data == "adm_edit_welcome":
+        context.user_data["admin_state"] = "waiting_welcome"
+        await query.edit_message_text("📝 <b>أرسل الآن نص رسالة الترحيب الجديدة كرسالة عادية:</b>\n\n(تلميح: يمكنك استخدام <code>{name}</code> بداخل النص ليتم استبداله باسم المستخدم تلقائياً)", parse_mode='HTML')
         
-    msg = await update.message.reply_text("🔄 جاري جمع الإحصائيات...")
-    db_stats = await db.command("dbstats")
-    data_size_mb = db_stats.get("dataSize", 0) / (1024 * 1024)
-    
-    users_cursor = users_collection.find({})
-    users_list = await users_cursor.to_list(length=None)
-    total_users = len(users_list)
-    
-    users_text = "قائمة المستخدمين:\n\n"
-    for u in users_list:
-        uname = f"@{u['username']}" if u.get('username') else "لا يوجد"
-        users_text += f"- {u.get('first_name')} | {uname} | {u.get('user_id')}\n"
-    
-    with open("users_list.txt", "w", encoding="utf-8") as f:
-        f.write(users_text)
+    elif query.data == "adm_ban":
+        context.user_data["admin_state"] = "waiting_ban"
+        await query.edit_message_text("🚫 <b>أرسل آيدي (ID) المستخدم الذي تريد حظره الآن:</b>", parse_mode='HTML')
         
-    stats_msg = (
-        f"📊 <b>إحصائيات البوت</b>\n\n"
-        f"👥 عدد المستخدمين الكلي: {total_users}\n"
-        f"💾 استهلاك مساحة السحابة (MongoDB): {data_size_mb:.2f} MB من أصل 500 MB\n"
-    )
-    
-    await update.message.reply_document(document=open("users_list.txt", "rb"), caption=stats_msg, parse_mode='HTML')
-    os.remove("users_list.txt")
-    await msg.delete()
-
-async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    try:
-        target_id = int(context.args[0])
-        await users_collection.update_one({"user_id": target_id}, {"$set": {"is_banned": True}})
-        await update.message.reply_text(f"✅ تم حظر المستخدم <code>{target_id}</code> بنجاح.", parse_mode='HTML')
-    except (IndexError, ValueError):
-        await update.message.reply_text("❌ أرسل الأمر متبوعاً بآيدي المستخدم.\nمثال: `/ban 123456789`")
+    elif query.data == "adm_unban":
+        context.user_data["admin_state"] = "waiting_unban"
+        await query.edit_message_text("🔓 <b>أرسل آيدي (ID) المستخدم لإلغاء الحظر عنه:</b>", parse_mode='HTML')
 
 # ==========================================
-# قسم سيرفر الريندر (Render Health Server)
+# سيرفر الريندر والتفعيل الأساسي
 # ==========================================
-async def health_handler(request):
-    return web.Response(text="Bot is alive and running!")
+async def health_handler(request): return web.Response(text="Bot is operational")
 
 async def _start_health_server():
     app = web.Application()
     app.router.add_get('/', health_handler)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', PORT)
-    await site.start()
-    logger.info(f"🌐 Health server started on port {PORT}")
-
-async def _keep_alive(app):
-    while True:
-        await asyncio.sleep(600)
+    await web.TCPSite(runner, '0.0.0.0', PORT).start()
 
 async def _post_init(app: Application):
     await _start_health_server()
-    asyncio.create_task(_keep_alive(app))
 
-# ==========================================
-# التشغيل الأساسي
-# ==========================================
 def main():
-    # 1. تجهيز الكوكيز قبل تشغيل أي شيء
     setup_cookies()
-    
-    # 2. بناء التطبيق
     app = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
 
-    # 3. الأوامر
+    # الأوامر ومستمعات الأحداث
     app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("stats", stats_command))
-    app.add_handler(CommandHandler("ban", ban_command))
+    app.add_handler(CommandHandler("admin", admin_panel))
+    app.add_handler(CallbackQueryHandler(admin_callbacks, pattern="^adm_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_messages))
 
-    # 4. تشغيل البوت
-    logger.info("🚀 Bot started!")
+    logger.info("🚀 البوت انطلق وجاهز للعمل!")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
