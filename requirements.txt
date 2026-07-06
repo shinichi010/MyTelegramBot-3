@@ -1,5 +1,5 @@
-python-telegram-bot==20.8
+python-telegram-bot>=21.0
 motor==3.3.2
 pymongo==4.6.3
-aiohttp==3.9.1
-yt-dlp==2023.12.30
+aiohttp>=3.9.1
+yt-dlp
