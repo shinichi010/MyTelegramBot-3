@@ -290,6 +290,7 @@ async def process_download(message: types.Message):
             except Exception:
                 pass
 
+
 # --- خادم ويب مصغر لمنع نوم السيرفر على Render ---
 async def handle_health_check(request):
     return web.Response(text="Bot is running live 24/7!")
