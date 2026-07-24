@@ -6,6 +6,7 @@ import asyncio
 import logging
 from datetime import datetime
 from aiohttp import web
+import aiohttp
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.types import FSInputFile, InputMediaPhoto, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
@@ -20,6 +21,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 COOKIES_TEXT = os.getenv("COOKIES_TEXT", "")
+
+# رابط سيرفر PO Token (اختياري - لتخطي حظر يوتيوب لـ "Sign in to confirm you're not a bot")
+# شغّل bgutil-ytdlp-pot-provider جنب البوت وحط رابطه هنا، مثلاً: http://127.0.0.1:4416
+POT_PROVIDER_URL = os.getenv("POT_PROVIDER_URL", "")
 
 # إنشاء مجلد التحميلات المؤقتة
 DOWNLOAD_DIR = "downloads"
@@ -53,6 +58,7 @@ async def start_web_server():
     port = int(os.getenv("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
+    logging.info(f"🌐 Web server running on port {port}")
 
 async def is_banned(user_id: int) -> bool:
     user = await users_col.find_one({"user_id": user_id})
@@ -80,7 +86,6 @@ async def start_handler(message: types.Message):
         }
         await users_col.insert_one(new_user)
 
-        # 📩 إرسال إشعار للمطور في خاص البوت مباشرة
         if ADMIN_ID:
             log_text = (
                 f"🔔 **مستخدم جديد قام بتشغيل البوت!**\n\n"
@@ -139,7 +144,7 @@ async def export_users(call: types.CallbackQuery):
     text_data = "قائمة المستخدمين:\n\n"
     async for u in users_cursor:
         text_data += f"ID: {u.get('user_id')} | Name: {u.get('name')} | User: @{u.get('username')}\n"
-    
+
     buffer = io.BytesIO(text_data.encode('utf-8'))
     file = BufferedInputFile(buffer.getvalue(), filename="users.txt")
     await call.message.answer_document(file, caption="📄 قائمة المشتركين")
@@ -161,6 +166,21 @@ async def unban_user(message: types.Message):
             await users_col.update_one({"user_id": int(args[1])}, {"$set": {"is_banned": False}})
             await message.answer("✅ تم إلغاء الحظر.")
 
+# --- تحميل صورة واحدة بهيدرز صحيحة (لتخطي حماية Referer عند تيك توك) ---
+async def fetch_image_bytes(session: aiohttp.ClientSession, url: str) -> bytes | None:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://www.tiktok.com/",
+    }
+    try:
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            if resp.status == 200:
+                return await resp.read()
+            logging.error(f"Image fetch failed status={resp.status} url={url}")
+    except Exception as e:
+        logging.error(f"Image fetch error: {e}")
+    return None
+
 # --- المعالجة والتحميل الشامل ---
 @dp.message(F.text.startswith("http"))
 async def process_download(message: types.Message):
@@ -172,17 +192,22 @@ async def process_download(message: types.Message):
     timestamp = int(datetime.now().timestamp())
     output_template = f"{DOWNLOAD_DIR}/{message.from_user.id}_{timestamp}_%(title)s.%(ext)s"
 
-    # إعدادات yt-dlp مع دعم الكوكيز للفيسبوك ويوتيوب
+    # إعدادات yt-dlp مع دعم الكوكيز والـ PO Token (يوتيوب) وهيدرز واقعية (تيك توك)
     ydl_opts = {
         'outtmpl': output_template,
         'quiet': True,
         'no_warnings': True,
         'format': 'bestvideo+bestaudio/best',
         'merge_output_format': 'mp4',
+        'extractor_args': {},
     }
 
     if os.path.exists(COOKIE_FILE_PATH):
         ydl_opts['cookiefile'] = COOKIE_FILE_PATH
+
+    # تفعيل مزود PO Token إذا محدد (يحل مشكلة "Sign in to confirm you're not a bot")
+    if POT_PROVIDER_URL:
+        ydl_opts['extractor_args']['youtubepot-bgutilhttp'] = {'base_url': [POT_PROVIDER_URL]}
 
     loop = asyncio.get_event_loop()
 
@@ -192,7 +217,7 @@ async def process_download(message: types.Message):
                 return ydl.extract_info(url, download=True)
 
         info = await loop.run_in_executor(None, download_action)
-        
+
         if not info:
             return await status_msg.edit_text("❌ لم نتمكن من استخراج هذا الرابط.")
 
@@ -201,32 +226,48 @@ async def process_download(message: types.Message):
         location = info.get('location') or info.get('country')
         tags = info.get('tags') or []
 
-        # تفاصيل تيكتوك
         caption_lines = [f"👤 **المستخدم:** {uploader_handle}"]
         if location:
             caption_lines.append(f"🌍 **الدولة:** {location}")
         if tags:
             caption_lines.append(f"🏷 **الهاشتاقات:** " + " ".join([f"#{t}" for t in tags[:5]]))
-        
+
         caption = "\n".join(caption_lines)
 
-        # البحث عن الملفات المحملة في مجلد التنزيلات
         downloaded_files = glob.glob(f"{DOWNLOAD_DIR}/{message.from_user.id}_{timestamp}_*")
 
-        # معالجة ألبومات صور تيكتوك المباشرة
+        # معالجة ألبومات صور تيك توك: نحمّل كل صورة بالسيرفر أولاً (بهيدرز صحيحة)
+        # بدل ما نرسل الرابط مباشرة لتليجرام، لأن تيك توك يرفض الطلبات بدون Referer صحيح
         images = info.get('images') or []
         if images and not downloaded_files:
-            await status_msg.edit_text("📸 جاري إرسال ألبوم الصور...")
-            chunk_size = 10
-            for i in range(0, len(images), chunk_size):
-                chunk = images[i:i + chunk_size]
-                media_group = [InputMediaPhoto(media=img, caption=caption if i == 0 and idx == 0 else "", parse_mode="Markdown") for idx, img in enumerate(chunk)]
-                await bot.send_media_group(chat_id=message.chat.id, media=media_group)
-            
+            await status_msg.edit_text("📸 جاري تحميل وإرسال ألبوم الصور...")
+            async with aiohttp.ClientSession() as session:
+                chunk_size = 10
+                for i in range(0, len(images), chunk_size):
+                    chunk = images[i:i + chunk_size]
+                    media_group = []
+                    for idx, img_url in enumerate(chunk):
+                        img_bytes = await fetch_image_bytes(session, img_url)
+                        if not img_bytes:
+                            continue
+                        photo_file = BufferedInputFile(img_bytes, filename=f"img_{i + idx}.jpg")
+                        media_group.append(
+                            InputMediaPhoto(
+                                media=photo_file,
+                                caption=caption if i == 0 and idx == 0 else "",
+                                parse_mode="Markdown"
+                            )
+                        )
+                    if media_group:
+                        await bot.send_media_group(chat_id=message.chat.id, media=media_group)
+
             await status_msg.delete()
             return
 
         # رفع الملفات المحملة لتلجرام (فيديو أو صوت)
+        if not downloaded_files:
+            return await status_msg.edit_text("❌ لم يتم العثور على ملفات بعد التحميل. جرب رابط آخر.")
+
         for file_path in downloaded_files:
             file_input = FSInputFile(file_path)
             if file_path.endswith(('.mp4', '.mkv', '.webm')):
